@@ -92,6 +92,10 @@ class PseudoDataset(torch.utils.data.Dataset):
             assert 'seg' in data
             gt_dict['seg'] = F.softmax(data['seg']*100, dim=0) # Argmax (one-hot vector)
         
+        elif self.args.predict_semantics:
+            assert 'seg_inv_rend' in data
+            gt_dict['seg_inv_rend'] = F.softmax(data['seg_inv_rend'].float()*100, dim=0) # Argmax (one-hot vector)
+        
         return gt_dict
     
     def __getitem__(self, idx):

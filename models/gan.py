@@ -207,14 +207,16 @@ class TextureDiscriminator(nn.Module):
         print('TextureDiscriminator parameters: {:.2f}M'.format(total_params/1000000))
         
     def forward(self, x, c=None, caption=None, seg=None):
+        #breakpoint()
         if self.downsample > 1:
             x = F.avg_pool2d(x, self.downsample)
             
         if self.args.mask_output:
             with torch.no_grad():
                 ds_factor = 16 if self.stride_first else 8
-                downsampled_mask = F.avg_pool2d(x[:, 3:4], ds_factor)
-        
+                #downsampled_mask = F.avg_pool2d(x[:, 3:4], ds_factor)
+                downsampled_mask = F.avg_pool2d(x[:, -1:], ds_factor)
+                
         cat_list = []
             
         if self.positional_embeddings:
@@ -268,18 +270,37 @@ class MultiScaleDiscriminator(nn.Module):
         
         if args.num_discriminators == 3:
             self.d3 = TextureDiscriminator(args, nc, 4)
+            
         elif args.num_discriminators != 2:
             raise
         
-    def forward(self, x, mesh_map=None, c=None, caption=None, seg=None):
+        if args.predict_semantics:
+            self.d_seg = TextureDiscriminator(args, args.num_parts+1, 1)
+        
+    def forward(self, x, mesh_map=None, c=None, caption=None, seg=None, x_seg=None):
         d1, m1 = self.d1(x, c, caption, seg)
         d2, m2 = self.d2(x, mesh_map, c, caption, seg)
+        
+        if self.args.predict_semantics:
+            assert x_seg is not None
+            d_seg, m_seg = self.d_seg(x_seg, c, caption, seg)
+        
         if self.args.num_discriminators == 3:
             d3, m3 = self.d3(x, c, caption, seg)
-            return [d1, d2, d3], [m1, m2, m3]
+            
+            if self.args.predict_semantics:
+                return [d1, d2, d3, d_seg], [m1, m2, m3, m_seg]
+                
+            else:
+                return [d1, d2, d3], [m1, m2, m3]
+            
         else:
-            return [d1, d2], [m1, m2]
-
+            if self.args.predict_semantics:
+                return [d1, d2, d_seg], [m1, m2, m_seg]
+                
+            else:
+                return [d1, d2], [m1, m2]
+            
 
 
 class ConditionalBatchNorm2d(nn.Module):
@@ -355,6 +376,7 @@ class Generator(nn.Module):
             self.emb_class = nn.Embedding(args.n_classes[0], emb_dim//2)
             self.emb_color = nn.Embedding(args.n_classes[1], emb_dim//2)
             emb_dim += emb_dim
+            
         elif args.conditional_class:
             self.emb_class = nn.Embedding(args.n_classes[0], emb_dim)
             emb_dim += emb_dim
@@ -365,6 +387,7 @@ class Generator(nn.Module):
             self.enc2 = nn.utils.spectral_norm(nn.Conv2d(64, 256 if args.short_model else 128, 3, stride=2, padding=(1, 0))) # 64 -> 32
             self.enc3 = nn.utils.spectral_norm(nn.Conv2d(128, 256, 3, stride=2, padding=(1, 0))) # 32 -> 16
             self.enc4 = nn.utils.spectral_norm(nn.Conv2d(256, 512, 3, stride=2, padding=(1, 0))) # 16 -> 8
+            
         else:
             self.fc = nn.Linear(emb_dim, self.height*self.width*512)
 
@@ -386,6 +409,10 @@ class Generator(nn.Module):
         self.blk5 = ResBlockUp(args, 128, 128, emb_dim, self.pad) # 64|128|256 -> 128|256|512
         self.blk6 = ResBlockUp(args, 128, 64, emb_dim, self.pad) # 128|256|512 (no upscale)
         self.conv_final = nn.Conv2d(64, 3, 5, padding=(2, 0))
+        
+        if self.args.predict_semantics:
+            self.blk6_seg = ResBlockUp(args, 128, 64, emb_dim, self.pad) # 128|256|512 (no upscale)
+            self.conv_final_seg = nn.Conv2d(64, self.args.num_parts, 5, padding=(2, 0))
         
         self.mesh_head = mesh_head
         if mesh_head:
@@ -419,6 +446,7 @@ class Generator(nn.Module):
             x = self.relu(self.enc2(self.pad(x, 1)))
             x = self.relu(self.enc3(self.pad(x, 1)))
             x = self.relu(self.enc4(self.pad(x, 1)))
+            
         else:
             x = self.fc(z)
             x = x.view(x.shape[0], -1, self.height, self.width)
@@ -443,8 +471,13 @@ class Generator(nn.Module):
             x_tex = self.up(self.blk3c(x_tex, z)) # x32
         x_tex = self.up(self.blk4(x_tex, z))
         x_tex = self.up(self.blk5(x_tex, z))
+        x_seg = x_tex if self.args.predict_semantics else None
         x_tex = self.relu(self.blk6(x_tex, z)) # No upscaling
         x_tex = self.conv_final(self.pad(x_tex, 2)).tanh_()
+        
+        if self.args.predict_semantics:
+            x_seg = self.relu(self.blk6_seg(x_seg, z)) # No upscaling
+            x_seg = F.softmax(self.conv_final_seg(self.pad(x_seg, 2))*100, dim=1)
         
         if self.mesh_head:
             x_mesh = self.relu(self.blk3_mesh(x, z)) # No upscaling
@@ -455,15 +488,20 @@ class Generator(nn.Module):
         
         if self.symmetric:
             x_tex = symmetrize_texture(x_tex)
+            if self.args.predict_semantics:
+                x_seg = symmetrize_texture(x_seg)
             if self.mesh_head:
                 x_mesh = symmetrize_texture(x_mesh)
             if attention_map is not None:
                 attention_map = symmetrize_texture(attention_map)
         
         if return_attention:
-            return x_tex, x_mesh, attention_map
+            #return x_tex, x_mesh, attention_map
+            return x_tex, x_mesh, x_seg, attention_map 
+            
         else:
-            return x_tex, x_mesh
+            #return x_tex, x_mesh
+            return x_tex, x_mesh, x_seg
         
         
 

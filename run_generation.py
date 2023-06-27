@@ -18,16 +18,16 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data
 
-from rendering.mesh_template import MeshTemplate
+from rendering.mesh_template_new import MeshTemplate
 from rendering.utils import qrot
 
 from utils.fid import RepeatIterator, calculate_stats, calculate_frechet_distance, init_inception, forward_inception_batch
-from utils.losses import GANLoss, loss_flat
+from utils.losses_new import GANLoss, loss_flat
 
-from data.pseudo_dataset import PseudoDataset, PseudoDatasetForEvaluation
+from data.pseudo_dataset_new import PseudoDataset, PseudoDatasetForEvaluation
 from data.definitions import class_indices, default_cache_directories
 
-from models.gan import MultiScaleDiscriminator, Generator
+from models.gan_new import MultiScaleDiscriminator, Generator
 
 try:
     from tqdm import tqdm
@@ -46,6 +46,7 @@ parser.add_argument('--conditional_class', action='store_true', help='condition 
 parser.add_argument('--conditional_color', action='store_true', help='condition the model on colors')
 parser.add_argument('--conditional_text', action='store_true', help='condition the model on captions')
 parser.add_argument('--conditional_semantics', action='store_true', help='condition the model on semantics')
+parser.add_argument('--predict_semantics', action='store_true', help='predict semantics')
 parser.add_argument('--num_parts', type=int, default=-1, help='number of semantic parts (-1 = autodetect)')
 parser.add_argument('--norm_g', type=str, default='syncbatch', help='(syncbatch|batch|instance|none)')
 parser.add_argument('--latent_dim', type=int, default=64, help='dimensionality of the random vector z')
@@ -91,7 +92,9 @@ parser.add_argument('--truncation_sigma', type=float, default=-1, help='-1 = aut
 parser.add_argument('--filter_class', type=str, help='class to select in conditional model (evaluation only)')
 
 args = parser.parse_args()
-print(args)
+#print(args)
+#breakpoint()
+assert not (args.conditional_semantics and args.predict_semantics), 'This mode is unsupported.'
 
 cache_dir = os.path.join('cache', args.dataset)
 if not os.path.isdir(cache_dir):
@@ -119,6 +122,10 @@ if args.conditional_semantics:
     args.num_parts = train_ds[0]['seg'].shape[0]
     print(f'Enabled semantic conditioning with {args.num_parts} object parts')
 
+if args.predict_semantics:
+    args.num_parts = train_ds[0]['seg_inv_rend'].shape[0]
+    print(f'Enabled semantics prediction with {args.num_parts} object parts')
+    
 if args.iters != -1:
     print('Iterations specified:', args.iters)
     iters_per_epoch = int(len(train_ds) / args.batch_size)
@@ -146,7 +153,7 @@ if args.truncation_sigma < 0:
 # A few safety checks...
 if args.num_discriminators >= 3:
     assert args.texture_resolution >= 512
-    
+
 if args.conditional_color or args.conditional_text:
     print('--conditional_color or --conditional_text are unsupported!')
     sys.exit(1)
@@ -283,11 +290,12 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
             else:
                 c, caption = None, None
                 
-            if args.conditional_semantics:
+            if args.conditional_semantics: #or args.predict_semantics:
                 seg = data['seg'].cuda()
             else:
                 seg = None
-
+            
+            
 
             noise = torch.randn(data['idx'].shape[0], args.latent_dim)
             
@@ -301,7 +309,7 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
             noise = noise.cuda()
             
             if noise.shape[0] % len(gpu_ids) == 0:
-                pred_tex, pred_mesh_map, attn_map = trainer('inference', None, None, C=c, caption=caption, seg=seg, noise=noise)
+                pred_tex, pred_mesh_map, pred_seg, attn_map = trainer('inference', None, None, C=c, caption=caption, seg=seg, noise=noise)
             else:
                 # Batch dimension is not divisible by number of GPUs --> pad
                 original_bsz = noise.shape[0]
@@ -324,7 +332,7 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
                 else:
                     seg_pad = None
 
-                pred_tex, pred_mesh_map, attn_map = trainer('inference', None, None, C=c_pad,
+                pred_tex, pred_mesh_map, pred_seg, attn_map = trainer('inference', None, None, C=c_pad,
                                                             caption=caption_pad, seg=seg_pad, noise=noise_pad)
                 
                 # Unpad
@@ -359,7 +367,7 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
                     sample_tex_real.append(data['texture'][mask].cpu())
                 if args.conditional_text:
                     sample_text.append(caption[0][mask].cpu())
-                if args.conditional_semantics:
+                if args.conditional_semantics: # or args.predict_semantics:
                     sample_seg.append(seg[mask].cpu())
                 
             if has_pseudogt:
@@ -384,7 +392,7 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
         sample_tex_real = torch.cat(sample_tex_real, dim=0)
     if args.conditional_text:
         sample_text = torch.cat(sample_text, dim=0)
-    if args.conditional_semantics:
+    if args.conditional_semantics: #or args.predict_semantics:
         sample_seg = torch.cat(sample_seg, dim=0)
     if shuffle_idx is not None:
         sample_fake = sample_fake[shuffle_idx]
@@ -397,7 +405,7 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
             sample_tex_real = sample_tex_real[shuffle_idx]
         if args.conditional_text:
             sample_text = sample_text[shuffle_idx]
-        if args.conditional_semantics:
+        if args.conditional_semantics: #or args.predict_semantics:
             sample_seg = sample_seg[shuffle_idx]
 
 
@@ -448,7 +456,7 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
                 full_text += '  \n'
             writer.add_text('render/caption', full_text, it)
         
-        if args.conditional_semantics:
+        if args.conditional_semantics: #or args.predict_semantics:
             grid_seg = torchvision.utils.make_grid(sample_seg.data[:, :3], nrow=4)
             writer.add_image('image/real_seg', grid_seg, it)
 
@@ -536,45 +544,74 @@ class ModelWrapper(nn.Module):
         
         if args.num_discriminators == 2 and args.texture_resolution >= 512:
             d_weight = [2, 1] # Texture discriminator has a larger weight on the loss
+            
+            if args.predict_semantics:
+                d_weight += [1]
+            
         else:
             d_weight = None # Unweighted
+            
         if mode == 'g':
-            pred_tex, pred_mesh = self.generator(noise, C, caption, seg)
+            #breakpoint()
+            pred_tex, pred_mesh, pred_seg = self.generator(noise, C, caption, seg)
             X_fake = torch.cat((pred_tex * X_alpha, X_alpha), dim=1) # Mask output
             X_fake_mesh = pred_mesh
-
-            discriminated, mask = self.discriminator(X_fake, X_fake_mesh, C, caption, seg)
+            X_seg_fake = torch.cat((pred_seg * X_alpha, X_alpha), dim=1) # Mask output
+            
+            discriminated, mask = self.discriminator(X_fake, X_fake_mesh, C, caption, seg, X_seg_fake)
+            #breakpoint() #ME
             loss = self.criterion_gan(discriminated, True, for_discriminator=False, mask=mask, weight=d_weight)
-            return loss, pred_tex, pred_mesh
+            
+            return loss, pred_tex, pred_mesh, pred_seg
+        
         elif mode == 'd':
+            #breakpoint()
             # D mode
             with torch.no_grad():
-                pred_tex, pred_mesh = self.generator(noise, C, caption, seg)
+                pred_tex, pred_mesh, pred_seg = self.generator(noise, C, caption, seg)
                 X_fake = torch.cat((pred_tex * X_alpha, X_alpha), dim=1) # Mask output
                 X_fake_mesh = pred_mesh
-                    
+                X_seg_fake = torch.cat((pred_seg * X_alpha, X_alpha), dim=1) # Mask output
+                
                 X_real = torch.cat((X_tex, X_alpha), dim=1)
                 assert (X_mesh is None) == (pred_mesh is None)
                 X_combined = torch.cat((X_fake, X_real), dim=0)
                 C_combined = torch.cat((C, C), dim=0) if C is not None else None
                 caption_combined = [torch.cat((x, x), dim=0) for x in caption] if caption is not None else None
-                seg_combined = torch.cat((seg, seg), dim=0) if seg is not None else None
+                
+                if args.predict_semantics:
+                    #breakpoint()
+                    assert seg is not None
+                    X_seg_real = torch.cat((seg * X_alpha, X_alpha), dim=1)
+                    seg_combined = torch.cat((X_seg_fake, X_seg_real), dim=0)
+                    
+                else:
+                    seg_combined = torch.cat((seg, seg), dim=0) if seg is not None else None
+                
+                
                 if pred_mesh is not None:
                     X_real_mesh = X_mesh
                     X_combined_mesh = torch.cat((X_fake_mesh, X_real_mesh), dim=0)
+                    
                 else:
                     X_combined_mesh = None
-            discriminated, mask = self.discriminator(X_combined, X_combined_mesh, C_combined, caption_combined, seg_combined)
+                    
+                
+                    
+                    
+            discriminated, mask = self.discriminator(X_combined, X_combined_mesh, C_combined, caption_combined, seg=seg, x_seg=seg_combined)
             discriminated_fake, discriminated_real = divide_pred(discriminated)
             mask_fake, mask_real = divide_pred(mask)
             loss_fake = self.criterion_gan(discriminated_fake, False, for_discriminator=True, mask=mask_fake, weight=d_weight)
             loss_real = self.criterion_gan(discriminated_real, True, for_discriminator=True, mask=mask_real, weight=d_weight)
-            return loss_fake, loss_real, pred_tex, pred_mesh
+            
+            return loss_fake, loss_real, pred_tex, pred_mesh, pred_seg
+        
         else:
             # Inference mode
             with torch.no_grad():
-                pred_tex, pred_mesh, attn_map = self.generator_running_avg(noise, C, caption, seg, return_attention=True)
-            return pred_tex, pred_mesh, attn_map
+                pred_tex, pred_mesh, pred_seg, attn_map,  = self.generator_running_avg(noise, C, caption, seg, return_attention=True)
+            return pred_tex, pred_mesh, pred_seg, attn_map
 
 
 
@@ -631,6 +668,7 @@ if args.conditional_text:
     elif not args.evaluate:
         g_parameters = generator.parameters()
         d_parameters = discriminator.parameters()
+        
 elif not args.evaluate:
     g_parameters = generator.parameters()
     d_parameters = discriminator.parameters()
@@ -735,22 +773,26 @@ try:
                 
             if args.conditional_semantics:
                 seg = data['seg'].cuda()
+            
+            elif args.predict_semantics:
+                seg = data['seg_inv_rend'].cuda()
+            
             else:
                 seg = None
 
-                
+            
             if use_mesh:
                 X_mesh = data['mesh'].cuda()
             else:
                 X_mesh = None
 
-            
             if total_it % (1 + args.d_steps_per_g) == 0:
+                #breakpoint()
                 # --------------------------------------------- Generator loop
                 optimizer_g.zero_grad()
-
-                loss, pred_tex, pred_mesh = trainer('g', None, X_alpha, None, C, caption, seg)
-
+                
+                loss, pred_tex, pred_mesh, pred_seg = trainer('g', None, X_alpha, None, C, caption, seg)
+                
                 if use_mesh:
                     vtx = mesh_template.get_vertex_positions(pred_mesh)
                     flat_loss = loss_flat(mesh_template.mesh, mesh_template.compute_normals(vtx))
@@ -768,11 +810,13 @@ try:
                     writer.add_scalar(f'gan_{args.loss}/g', loss_gan.item(), total_it)
                     if use_mesh:
                         writer.add_scalar('flat', flat_loss.item(), total_it)
+                        
             else:
+                #breakpoint()
                 # --------------------------------- Discriminator loop
                 optimizer_d.zero_grad()
 
-                loss_fake, loss_real, pred_tex, pred_mesh = trainer('d', X_tex, X_alpha, X_mesh, C, caption, seg)
+                loss_fake, loss_real, pred_tex, pred_mesh, pred_seg = trainer('d', X_tex, X_alpha, X_mesh, C, caption, seg)
                 loss_fake = loss_fake.mean()
                 loss_real = loss_real.mean()
                 loss = loss_fake + loss_real
@@ -791,7 +835,7 @@ try:
                                                                         flat_curve[-1]))
             
             total_it += 1
-
+        
         epoch += 1
         
         log('Time per epoch: {:.3f} s'.format(time.time() - start_time))
@@ -941,7 +985,8 @@ elif args.export_sample:
 
             generator_running_avg.eval()
             noise = noise.cuda()
-            pred_tex, pred_mesh_map, attn_map = trainer('inference', None, None, C=c, caption=caption, seg=seg, noise=noise)
+            pred_tex, pred_mesh_map, pred_seg, attn_map = trainer('inference', None, None, C=c, caption=caption, seg=seg, noise=noise)
+            
             vtx = mesh_template.get_vertex_positions(pred_mesh_map)
             vtx_obj = vtx.clone()
             vtx_obj[..., :] = vtx_obj[..., [0, 2, 1]] # Swap Y and Z (the result is Y up)
@@ -949,8 +994,15 @@ elif args.export_sample:
             pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
             for i, v in enumerate(vtx_obj):
                 j = i + i_pass * args.batch_size
-                mesh_template.export_obj(os.path.join(output_dir, f'mesh_{j}'), v, pred_tex[i]/2 + 0.5)
-
+                mesh_name = f'mesh_{j:0>6d}'
+                mesh_template.export_obj(os.path.join(output_dir, f'{mesh_name}'), v, pred_tex[i]/2 + 0.5)
+            
+                # Export segmentation maps
+                if args.predict_semantics:
+                    seg_obj = np.array(pred_seg[i].argmax(dim=0).cpu())
+                    np.save(os.path.join(output_dir, f'{mesh_name}_seg.npy'), seg_obj)
+                    #breakpoint()
+            
             rotation = train_ds.data['rotation'][indices].cuda()
             scale = train_ds.data['scale'][indices].cuda()
             translation = train_ds.data['translation'][indices].cuda()

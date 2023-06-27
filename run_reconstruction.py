@@ -209,7 +209,8 @@ class CategoryMerger(torch.utils.data.Dataset):
                 break
             prev = offset
         dataset = self.datasets[category_idx]
-        sample = list(dataset[dataset_idx]) # Tuple to list
+        sample_dict = dataset[dataset_idx]
+        sample = list(sample_dict) # Tuple to list
         
         seg = sample[1]
         w = sample[-3]
@@ -259,7 +260,9 @@ if args.dataset == 'all':
     cats = list(default_cache_directories.values())
 else:
     cats = [args.dataset]
-enable_seg = not args.generate_pseudogt and args.prediction_type in ['semantics', 'both']
+#enable_seg = not args.generate_pseudogt and args.prediction_type in ['semantics', 'both']
+enable_seg = args.prediction_type in ['semantics', 'both']
+
 mesh_ds_train = CategoryMerger(cats, False, dataloader_resolution, enable_seg=enable_seg)
 
 if args.iters != -1:
@@ -276,7 +279,8 @@ if args.iters != -1:
     print(f'*** Decaying lr every {args.lr_decay_every} epochs ***')
 
 if args.generate_pseudogt:
-    mesh_ds_inception = CategoryMerger(cats, False, dataloader_resolution, unfiltered=True, enable_seg=False)
+    #mesh_ds_inception = CategoryMerger(cats, False, dataloader_resolution, unfiltered=True, enable_seg=False) # Original
+    mesh_ds_inception = CategoryMerger(cats, False, dataloader_resolution, unfiltered=True, enable_seg=True) #ME
 
 batch_size = args.batch_size
 shuffle = not (args.generate_pseudogt or args.evaluate)
@@ -544,6 +548,7 @@ try:
                 
             cat_input = []
             if args.prediction_type in ['semantics', 'both']:
+                
                 pred_seg_shape = pred_seg.shape
                 pred_seg_selection = torch.bmm(M, pred_seg.flatten(-2, -1))
                 pred_seg_selection = pred_seg_selection.view(*pred_seg_selection.shape[:2], *pred_seg_shape[2:])
@@ -565,6 +570,7 @@ try:
                                                                   target=cat_target,
                                                                   alpha_target=X_real[:, 3:4],
                                                                  )
+            
             color_loss = color_loss.mean()
             alpha_loss = alpha_loss.mean()
             miou = miou.mean()
@@ -685,7 +691,7 @@ elif args.generate_pseudogt:
     generator.eval()
     for net_image, seg, inception_image, hd_image, gt_scale, gt_translation, gt_rot, gt_z0, semi_w_batch, semi_mask_batch, \
         indices, C, M, M_mask in tqdm(train_loader):
-            
+        
         # Compute visibility mask
         with torch.no_grad():    
             net_image = net_image.cuda()
@@ -727,7 +733,8 @@ elif args.generate_pseudogt:
             if not shrink:
                 hd_image = hd_image[:, :3]
             inverse_tex, inverse_alpha = inverse_renderer(vtx, hd_image.cuda())
-
+            inverse_seg, _ = inverse_renderer(vtx, seg.cuda())
+            
             # Mask projection using the visibility mask
             mask = F.interpolate(visibility_mask, args.pseudogt_resolution,
                                  mode='bilinear', align_corners=False).permute(0, 2, 3, 1).cuda()
@@ -737,13 +744,16 @@ elif args.generate_pseudogt:
             if shrink:
                 inverse_alpha *= inverse_tex[..., 3:4]
                 inverse_tex = inverse_tex[..., :3]
-            
+                inverse_seg = inverse_seg[...,  1:]#:num_parts]
+                
             inverse_tex = inverse_tex.permute(0, 3, 1, 2)
             inverse_alpha = inverse_alpha.permute(0, 3, 1, 2)
+            inverse_seg = inverse_seg.permute(0, 3, 1, 2)
             
             # Convert to half to save disk space
             inverse_tex = inverse_tex.half().cpu()
             inverse_alpha = inverse_alpha.half().cpu()
+            inverse_seg = inverse_seg.half().cpu()
             
             all_gt_scale.append(gt_scale.cpu().clone())
             all_gt_translation.append(gt_translation.cpu().clone())
@@ -758,6 +768,7 @@ elif args.generate_pseudogt:
                     'seg': pred_seg_saved[i].cpu().clone(),
                     'texture': inverse_tex[i].clone(),
                     'texture_alpha': inverse_alpha[i].clone(),
+                    'seg_inv_rend': inverse_seg[i].clone(),
                     'image': inception_image[i].half().clone(),
                     'category': C[i].item(),
                 }
