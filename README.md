@@ -1,3 +1,9 @@
+# Note
+
+This is a fork of the original Textured 3D GAN implementation. It adds texture semantic map predictions along with the object mesh and texture.
+The repository is under active development. Please, come back soon to check the working version.
+
+
 # Learning Generative Models of Textured 3D Meshes from Real-World Images
 
 This is the reference implementation of "Learning Generative Models of Textured 3D Meshes from Real-World Images", accepted at **ICCV 2021**.
