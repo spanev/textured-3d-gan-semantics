@@ -18,16 +18,16 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data
 
-from rendering.mesh_template_new import MeshTemplate
+from rendering.mesh_template import MeshTemplate
 from rendering.utils import qrot
 
 from utils.fid import RepeatIterator, calculate_stats, calculate_frechet_distance, init_inception, forward_inception_batch
-from utils.losses_new import GANLoss, loss_flat
+from utils.losses import GANLoss, loss_flat
 
-from data.pseudo_dataset_new import PseudoDataset, PseudoDatasetForEvaluation
+from data.pseudo_dataset import PseudoDataset, PseudoDatasetForEvaluation
 from data.definitions import class_indices, default_cache_directories
 
-from models.gan_new import MultiScaleDiscriminator, Generator
+from models.gan import MultiScaleDiscriminator, Generator
 
 try:
     from tqdm import tqdm
@@ -46,7 +46,7 @@ parser.add_argument('--conditional_class', action='store_true', help='condition 
 parser.add_argument('--conditional_color', action='store_true', help='condition the model on colors')
 parser.add_argument('--conditional_text', action='store_true', help='condition the model on captions')
 parser.add_argument('--conditional_semantics', action='store_true', help='condition the model on semantics')
-parser.add_argument('--predict_semantics', action='store_true', help='predict semantics')
+parser.add_argument('--predict_semantics', action='store_true', help='the model will predict semantic maps as well')
 parser.add_argument('--num_parts', type=int, default=-1, help='number of semantic parts (-1 = autodetect)')
 parser.add_argument('--norm_g', type=str, default='syncbatch', help='(syncbatch|batch|instance|none)')
 parser.add_argument('--latent_dim', type=int, default=64, help='dimensionality of the random vector z')
@@ -92,8 +92,6 @@ parser.add_argument('--truncation_sigma', type=float, default=-1, help='-1 = aut
 parser.add_argument('--filter_class', type=str, help='class to select in conditional model (evaluation only)')
 
 args = parser.parse_args()
-#print(args)
-#breakpoint()
 assert not (args.conditional_semantics and args.predict_semantics), 'This mode is unsupported.'
 
 cache_dir = os.path.join('cache', args.dataset)
@@ -239,9 +237,11 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
     global m_real_val, s_real_val
     
     emb_arr_fake_combined = []
+    emb_arr_fake_combined_seg = []
     emb_arr_fake_texture_only = []
     emb_arr_fake_mesh_only = []
-
+    emb_arr_fake_seg_only = []
+    
     # Grid for visualization
     if visualization_indices is not None:
         indices_to_render = visualization_indices.numpy()
@@ -262,6 +262,7 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
         sample_fake_mesh_only = []
         sample_text = [] # For models trained with captions
         sample_seg = []
+        sample_seg_fake = []
         sample_tex_real = []
         sample_tex_fake = []
         sample_mesh_map_fake = []
@@ -290,13 +291,17 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
             else:
                 c, caption = None, None
                 
-            if args.conditional_semantics: #or args.predict_semantics:
+            if args.conditional_semantics:
                 seg = data['seg'].cuda()
+                
+            elif args.predict_semantics:
+                seg = data['seg_inv_rend'].cuda()
+            
             else:
                 seg = None
             
             
-
+            
             noise = torch.randn(data['idx'].shape[0], args.latent_dim)
             
             # Gaussian truncation trick
@@ -340,6 +345,8 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
                 pred_mesh_map = pred_mesh_map[:original_bsz]
                 if attn_map is not None:
                     attn_map = attn_map[:original_bsz]
+                if args.predict_semantics:
+                    pred_seg = pred_seg[:original_bsz]
 
             def render_and_score(input_mesh_map, input_texture, output_array):
                 vtx = mesh_template.get_vertex_positions(input_mesh_map)
@@ -367,8 +374,12 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
                     sample_tex_real.append(data['texture'][mask].cpu())
                 if args.conditional_text:
                     sample_text.append(caption[0][mask].cpu())
-                if args.conditional_semantics: # or args.predict_semantics:
+                if args.conditional_semantics: 
                     sample_seg.append(seg[mask].cpu())
+                #elif args.predict_semantics:
+                #    sample_seg_fake.append(pred_seg[mask].cpu())
+                #    raise NotImplemented
+                    
                 
             if has_pseudogt:
                 out_combined = render_and_score(data['mesh'], pred_tex, emb_arr_fake_texture_only)
@@ -377,7 +388,7 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
                 out_combined = render_and_score(pred_mesh_map, data['texture'], emb_arr_fake_mesh_only)
                 if len(mask) > 0:
                     sample_fake_mesh_only.append(out_combined[mask].cpu())
-    
+                
     emb_arr_fake_combined = np.concatenate(emb_arr_fake_combined, axis=0)
     if has_pseudogt:
         emb_arr_fake_texture_only = np.concatenate(emb_arr_fake_texture_only, axis=0)
@@ -392,8 +403,12 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
         sample_tex_real = torch.cat(sample_tex_real, dim=0)
     if args.conditional_text:
         sample_text = torch.cat(sample_text, dim=0)
-    if args.conditional_semantics: #or args.predict_semantics:
+    if args.conditional_semantics: 
         sample_seg = torch.cat(sample_seg, dim=0)
+    #elif args.predict_semantics:
+    #    sample_seg_fake = torch.cat(sample_seg_fake, dim=0)
+    #    raise NotImplemented
+        
     if shuffle_idx is not None:
         sample_fake = sample_fake[shuffle_idx]
         sample_mesh_map_fake = sample_mesh_map_fake[shuffle_idx]
@@ -405,9 +420,11 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
             sample_tex_real = sample_tex_real[shuffle_idx]
         if args.conditional_text:
             sample_text = sample_text[shuffle_idx]
-        if args.conditional_semantics: #or args.predict_semantics:
+        if args.conditional_semantics:
             sample_seg = sample_seg[shuffle_idx]
-
+        #elif args.predict_semantics:
+        #    sample_seg_fake = sample_seg_fake[shuffle_idx]
+        #    raise NotImplemented
 
     if m_real_val is not None:
         # Make sure the number of images is the same as that of the test set
@@ -456,11 +473,13 @@ def evaluate_fid(writer, it, visualization_indices=None, fast=False):
                 full_text += '  \n'
             writer.add_text('render/caption', full_text, it)
         
-        if args.conditional_semantics: #or args.predict_semantics:
+        if args.conditional_semantics:
             grid_seg = torchvision.utils.make_grid(sample_seg.data[:, :3], nrow=4)
             writer.add_image('image/real_seg', grid_seg, it)
-
         
+        # elif args.predict_semantics:
+            # raise NotImplemented
+            
         if m_real_val is not None:
             writer.add_scalar('fid/combined', fid_val, it)
             if has_pseudogt:
@@ -552,20 +571,17 @@ class ModelWrapper(nn.Module):
             d_weight = None # Unweighted
             
         if mode == 'g':
-            #breakpoint()
             pred_tex, pred_mesh, pred_seg = self.generator(noise, C, caption, seg)
             X_fake = torch.cat((pred_tex * X_alpha, X_alpha), dim=1) # Mask output
             X_fake_mesh = pred_mesh
             X_seg_fake = torch.cat((pred_seg * X_alpha, X_alpha), dim=1) # Mask output
             
             discriminated, mask = self.discriminator(X_fake, X_fake_mesh, C, caption, seg, X_seg_fake)
-            #breakpoint() #ME
             loss = self.criterion_gan(discriminated, True, for_discriminator=False, mask=mask, weight=d_weight)
             
             return loss, pred_tex, pred_mesh, pred_seg
         
         elif mode == 'd':
-            #breakpoint()
             # D mode
             with torch.no_grad():
                 pred_tex, pred_mesh, pred_seg = self.generator(noise, C, caption, seg)
@@ -580,7 +596,6 @@ class ModelWrapper(nn.Module):
                 caption_combined = [torch.cat((x, x), dim=0) for x in caption] if caption is not None else None
                 
                 if args.predict_semantics:
-                    #breakpoint()
                     assert seg is not None
                     X_seg_real = torch.cat((seg * X_alpha, X_alpha), dim=1)
                     seg_combined = torch.cat((X_seg_fake, X_seg_real), dim=0)
@@ -787,7 +802,6 @@ try:
                 X_mesh = None
 
             if total_it % (1 + args.d_steps_per_g) == 0:
-                #breakpoint()
                 # --------------------------------------------- Generator loop
                 optimizer_g.zero_grad()
                 
@@ -812,7 +826,6 @@ try:
                         writer.add_scalar('flat', flat_loss.item(), total_it)
                         
             else:
-                #breakpoint()
                 # --------------------------------- Discriminator loop
                 optimizer_d.zero_grad()
 
@@ -1001,7 +1014,6 @@ elif args.export_sample:
                 if args.predict_semantics:
                     seg_obj = np.array(pred_seg[i].argmax(dim=0).cpu())
                     np.save(os.path.join(output_dir, f'{mesh_name}_seg.npy'), seg_obj)
-                    #breakpoint()
             
             rotation = train_ds.data['rotation'][indices].cuda()
             scale = train_ds.data['scale'][indices].cuda()

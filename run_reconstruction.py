@@ -674,7 +674,7 @@ elif args.generate_pseudogt:
                           return_hardmask=True,
                          )
             return image_pred, alpha_pred
-
+    
     inverse_renderer = InverseRenderer(mesh_template.mesh, args.pseudogt_resolution, args.pseudogt_resolution)
 
     cache_dir = os.path.join('cache', args.dataset)
